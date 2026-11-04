@@ -1,0 +1,303 @@
+# Próba toru publikacji Raroga, paczka @rarog/publish-trial. Uruchamiany tylko ręcznie, z numerem
+# wersji, nazwą paczki i trybem próby. Trzy zadania:
+#
+# 1. build: typecheck, testy, tarball pakowacza (`scripts/package.mjs`) i obowiązkowy audyt tarballa wobec manifestu
+#    budowania (`scripts/package-audit.mjs`); tarball i manifest idą jako artefakt, sha256 tarballa jako wyjście;
+# 2. sbom: na Ubuntu i macOS tarball z build, sprawdzony sha256, instalacja `npm i -g` do prefiksu, SBOM CycloneDX
+#    zainstalowanej paczki jako artefakt na platformę;
+# 3. publish (bez trybu próby): ten sam tarball po sprawdzeniu sha256, `npm stage publish` z tokenem OIDC trusted
+#    publishera. Wersja czeka w rejestrze na zatwierdzenie z 2FA; workflow niczego nie zatwierdza.
+#
+# Uprawnienia na poziomie workflow puste; `id-token: write` ma tylko zadanie publish w środowisku `npm`. Wejścia
+# i wyjścia zadań docierają do powłoki wyłącznie przez `env`. Bez sekretów i bez cache menedżera paczek (zizmor,
+# `cache-poisoning`). Wersje akcji przypięte do SHA wydania (komentarz: tag i data wydania).
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Wersja paczki X.Y.Z; bez trybu próby workflow startuje z tagu vX.Y.Z
+        required: true
+        type: string
+      name:
+        description: Nazwa paczki w rejestrze npm
+        required: true
+        type: choice
+        options:
+          - '@rarog/publish-trial'
+        default: '@rarog/publish-trial'
+      dry-run:
+        description: Tryb próby, bez zadania publish
+        required: true
+        type: boolean
+        default: true
+
+permissions: {}
+
+# Jedna publikacja naraz; przebieg w toku nie znika po starcie następnego.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Tarball, testy i audyt
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    steps:
+      - name: wejścia
+        env:
+          VERSION: ${{ inputs.version }}
+          NAME: ${{ inputs.name }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::wejście version: oczekiwane X.Y.Z"
+            exit 1
+          fi
+          case "$NAME" in
+            @rarog/publish-trial) ;;
+            *)
+              echo "::error::wejście name: dozwolona tylko @rarog/publish-trial"
+              exit 1
+              ;;
+          esac
+          if [[ "$DRY_RUN" != true && "$GITHUB_REF" != "refs/tags/v$VERSION" ]]; then
+            echo "::error::publikacja startuje z tagu v$VERSION (gh workflow run publish.yml --ref v$VERSION)"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, 2026-07-20
+        with:
+          # Pełna historia gita jak w zadaniu Ubuntu `check.yml`: te same testy, ten sam checkout.
+          fetch-depth: 0
+          persist-credentials: false
+      # npm >= 11.15 w Node 24 (`npm stage`); pnpm z `packageManager` w package.json.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0, 2026-10-08
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0, 2026-09-05
+      # Wersja w package.json = wejście (= tag). `repository.url` = repo tego przebiegu: npm odrzuca provenance
+      # z innego repo, więc rozjazd wychodzi tutaj, nie po budowaniu.
+      - name: package.json
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          node -e "
+            const pkg = JSON.parse(require('node:fs').readFileSync('package.json', 'utf8'));
+            const [version, dryRun, repo] = process.argv.slice(1);
+            const wanted = 'git+https://github.com/' + repo + '.git';
+            if (pkg.version !== version) {
+              console.log('::error::package.json version ' + pkg.version + ', wejście ' + version);
+              process.exit(1);
+            }
+            if (pkg.repository?.url !== wanted) {
+              console.log((dryRun === 'true' ? '::notice::' : '::error::') + 'repository.url '
+                + pkg.repository?.url + ', repo przebiegu ' + wanted);
+              if (dryRun !== 'true') process.exit(1);
+            }
+          " "$VERSION" "$DRY_RUN" "$GITHUB_REPOSITORY"
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+      - name: typecheck
+        run: pnpm run typecheck
+      - name: testy
+        run: pnpm test
+      - name: tarball
+        id: pack
+        env:
+          VERSION: ${{ inputs.version }}
+          NAME: ${{ inputs.name }}
+        run: |
+          node scripts/package.mjs --version "$VERSION" --name "$NAME" --out "$RUNNER_TEMP/paczka"
+          base="${NAME#@}"
+          base="${base/\//-}-$VERSION"
+          if [ ! -f "$RUNNER_TEMP/paczka/$base.tgz" ] || [ ! -f "$RUNNER_TEMP/paczka/$base.build.json" ]; then
+            echo "::error::pakowacz nie dał $base.tgz i $base.build.json"
+            exit 1
+          fi
+          sha="$(shasum -a 256 "$RUNNER_TEMP/paczka/$base.tgz" | cut -d ' ' -f 1)"
+          echo "tarball=$base.tgz" >>"$GITHUB_OUTPUT"
+          echo "sha256=$sha" >>"$GITHUB_OUTPUT"
+      # Audyt listy plików obowiązkowy: `npm pack --dry-run --json` na tarballu i wpisy tarballa wobec manifestu
+      # budowania (ścieżki, rozmiary, sha256 plików, nazwa, wersja, integrity, brak SDK Claude).
+      - name: audyt tarballa
+        env:
+          VERSION: ${{ inputs.version }}
+          NAME: ${{ inputs.name }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          node scripts/package-audit.mjs --name "$NAME" --version "$VERSION" \
+            "$RUNNER_TEMP/paczka/$TARBALL" "$RUNNER_TEMP/paczka/${TARBALL%.tgz}.build.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, 2026-10-07
+        with:
+          name: paczka
+          path: ${{ runner.temp }}/paczka/
+          if-no-files-found: error
+      - name: podsumowanie
+        env:
+          VERSION: ${{ inputs.version }}
+          NAME: ${{ inputs.name }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+        run: |
+          {
+            echo "### $NAME@$VERSION"
+            echo
+            echo "- tarball: \`$TARBALL\`"
+            echo "- sha256: \`$SHA256\`"
+            echo "- tryb próby: $DRY_RUN"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  sbom:
+    name: SBOM (${{ matrix.os }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      # npm 11 jak w zadaniu publish: npm 10 przy paczce z zależnościami dołączanymi kładzie paczki platformy
+      # iroh wszystkich systemów, a SBOM wymieniłby je wszystkie.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0, 2026-10-08
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: wersja npm
+        run: |
+          version="$(npm --version)"
+          echo "npm $version"
+          [ "${version%%.*}" -ge 11 ] || { echo "::error::npm $version: SBOM wymaga npm >= 11"; exit 1; }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, 2026-10-07
+        with:
+          name: paczka
+          path: ${{ runner.temp }}/paczka
+      - name: sha256 tarballa
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          if [[ ! "$TARBALL" =~ ^[a-z0-9][a-z0-9._-]*\.tgz$ || ! "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::wyjścia zadania build: zła nazwa tarballa albo sha256"
+            exit 1
+          fi
+          echo "$SHA256  $RUNNER_TEMP/paczka/$TARBALL" | shasum -a 256 -c -
+      # Instalacja jak w teście dymnym paczki: własny prefiks i cache, pusty plik konfiguracji npm, bez skryptów.
+      # Bez lockfile celowo (zizmor `adhoc-packages`): SBOM opisuje to, co dostaje użytkownik, czyli zależności
+      # spoza bundla rozwiązane z rejestru. Zadanie nie ma uprawnień ani sekretów, a publish bierze tarball z build.
+      - name: npm i -g i SBOM
+        env:
+          NAME: ${{ inputs.name }}
+          VERSION: ${{ inputs.version }}
+          TARBALL: ${{ needs.build.outputs.tarball }}
+        run: | # zizmor: ignore[adhoc-packages]
+          w="$RUNNER_TEMP/sbom"
+          mkdir -p "$w/cwd" "$w/out"
+          : >"$w/empty-npmrc"
+          export npm_config_userconfig="$w/empty-npmrc" npm_config_cache="$w/npm-cache"
+          export npm_config_update_notifier=false
+          cd "$w/cwd"
+          npm i -g --prefix "$w/prefix" --ignore-scripts --no-audit --no-fund "$RUNNER_TEMP/paczka/$TARBALL"
+          platform="$(echo "$RUNNER_OS-$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
+          sbom="$w/out/${TARBALL%.tgz}.$platform.cdx.json"
+          (cd "$w/prefix/lib/node_modules/$NAME" && npm sbom --sbom-format cyclonedx --sbom-type application) >"$sbom"
+          node -e "
+            const bom = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'));
+            const [name, version] = process.argv.slice(2);
+            const names = (bom.components ?? []).map((one) => (one.group ? one.group + '/' : '') + one.name);
+            const problems = [];
+            if (bom.bomFormat !== 'CycloneDX') problems.push('bomFormat ' + bom.bomFormat);
+            const component = bom.metadata?.component ?? {};
+            if (component.name !== name || component.version !== version) {
+              problems.push('metadata.component ' + component.name + '@' + component.version);
+            }
+            if (names.some((one) => one.startsWith('@anthropic-ai/'))) problems.push('SDK Claude w SBOM');
+            console.log('SBOM: ' + names.length + ' paczek: ' + names.join(', '));
+            if (problems.length > 0) {
+              console.log('::error::SBOM: ' + problems.join('; '));
+              process.exit(1);
+            }
+          " "$sbom" "$NAME" "$VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, 2026-10-07
+        with:
+          name: sbom-${{ matrix.os }}
+          path: ${{ runner.temp }}/sbom/out/
+          if-no-files-found: error
+
+  publish:
+    name: npm stage publish
+    needs: [build, sbom]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Środowisko `npm`: tylko tagi `v*` i zatwierdzenie właściciela przed startem zadania; trusted publisher
+    # w rejestrze przyjmuje token tylko z tego workflow w tym środowisku.
+    environment: npm
+    permissions:
+      id-token: write
+    steps:
+      # Node 24 z wbudowanym npm >= 11.15; bez `registry-url` (plik `.npmrc` z tokenem) i bez `npm i -g npm`.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0, 2026-10-08
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: wersja npm
+        run: |
+          version="$(npm --version)"
+          echo "npm $version"
+          node -e "
+            const [major, minor] = process.argv[1].split('.').map(Number);
+            if (major < 11 || (major === 11 && minor < 15)) process.exit(1);
+          " "$version" || { echo "::error::npm $version: npm stage wymaga >= 11.15"; exit 1; }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, 2026-10-07
+        with:
+          name: paczka
+          path: ${{ runner.temp }}/paczka
+      - name: sha256 tarballa
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          if [[ ! "$TARBALL" =~ ^[a-z0-9][a-z0-9._-]*\.tgz$ || ! "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::wyjścia zadania build: zła nazwa tarballa albo sha256"
+            exit 1
+          fi
+          echo "$SHA256  $RUNNER_TEMP/paczka/$TARBALL" | shasum -a 256 -c -
+      # Pusty katalog roboczy i pusty plik konfiguracji npm: rejestr domyślny, token z OIDC, provenance z OIDC.
+      - name: npm stage publish
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+        run: |
+          w="$RUNNER_TEMP/stage"
+          mkdir -p "$w/cwd"
+          : >"$w/empty-npmrc"
+          cd "$w/cwd"
+          npm_config_userconfig="$w/empty-npmrc" npm_config_cache="$w/npm-cache" npm_config_update_notifier=false \
+            npm stage publish "$RUNNER_TEMP/paczka/$TARBALL" --ignore-scripts
+      - name: podsumowanie
+        env:
+          VERSION: ${{ inputs.version }}
+          NAME: ${{ inputs.name }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          {
+            echo "### $NAME@$VERSION czeka w rejestrze (staged)"
+            echo
+            echo "sha256 tarballa: \`$SHA256\`. Zatwierdzenie: \`npm stage list $NAME\`, \`npm stage download\`,"
+            echo "porównanie z własnym budowaniem, \`npm stage approve\` z 2FA."
+          } >>"$GITHUB_STEP_SUMMARY"

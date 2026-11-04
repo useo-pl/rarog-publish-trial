@@ -1,0 +1,22 @@
+{
+  "name": "@rarog/publish-trial",
+  "version": "0.0.1",
+  "description": "Próba toru wydania paczki npm Raroga: workflow publikacji, staged publishing i atestacja",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "rarog-publish-trial": "bin/publish-trial.mjs"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/useo-pl/rarog-publish-trial.git"
+  },
+  "packageManager": "pnpm@11.4.0",
+  "scripts": {
+    "typecheck": "node --check bin/publish-trial.mjs && node --check lib/report.mjs && node --check scripts/package.mjs && node --check scripts/package-audit.mjs",
+    "test": "node --test"
+  }
+}
